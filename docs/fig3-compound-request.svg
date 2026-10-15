@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="300" viewBox="0 0 980 300" role="img" aria-label="Request frame layout">
+  <style>
+  text { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 12px; fill: #1f2328; }
+  .box { fill: #fff; stroke: #57606a; stroke-width: 1.2; }
+  .box.k { fill: #eef5fc; stroke: #0b5cad; }
+  .box.u { fill: #fdf3e2; stroke: #c48a00; }
+  .box.n { fill: #eaf4ea; stroke: #2f7d32; }
+  .box.c { fill: #f3f0fa; stroke: #6a4fb3; }
+  .lane { fill: none; stroke: #d0d7de; stroke-dasharray: 4 4; }
+  .arrow { stroke: #57606a; stroke-width: 1.3; fill: none; marker-end: url(#arr); }
+  .label { fill: #57606a; font-size: 11px; }
+  .title { font-weight: 600; font-size: 13px; }
+</style>
+  <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#57606a"/></marker></defs>
+  <rect width="100%" height="100%" fill="#ffffff"/>
+  <rect x="20" y="40" width="60" height="44" class="box" rx="6"/><text x="50" y="58" text-anchor="middle" class="title">4 B</text><text x="50" y="74" text-anchor="middle" class="label">length</text>
+  <rect x="80" y="40" width="100" height="44" class="box k" rx="6"/><text x="130" y="58" text-anchor="middle" class="title">SMB2 hdr</text><text x="130" y="74" text-anchor="middle" class="label">64 B, msg id n</text>
+  <rect x="180" y="40" width="130" height="44" class="box" rx="6"/><text x="245" y="58" text-anchor="middle" class="title">CREATE body</text><text x="245" y="74" text-anchor="middle" class="label">path UTF-16</text>
+  <rect x="310" y="40" width="30" height="44" class="box" rx="6"/><text x="325" y="66" text-anchor="middle" class="label">pad</text>
+  <rect x="340" y="40" width="100" height="44" class="box k" rx="6"/><text x="390" y="58" text-anchor="middle" class="title">SMB2 hdr</text><text x="390" y="74" text-anchor="middle" class="label">id n+1, RELATED</text>
+  <rect x="440" y="40" width="140" height="44" class="box" rx="6"/><text x="510" y="58" text-anchor="middle" class="title">QUERY_INFO body</text><text x="510" y="74" text-anchor="middle" class="label">FileId = FF..FF</text>
+  <rect x="580" y="40" width="30" height="44" class="box" rx="6"/><text x="595" y="66" text-anchor="middle" class="label">pad</text>
+  <rect x="610" y="40" width="100" height="44" class="box k" rx="6"/><text x="660" y="58" text-anchor="middle" class="title">SMB2 hdr</text><text x="660" y="74" text-anchor="middle" class="label">id n+2, RELATED</text>
+  <rect x="710" y="40" width="110" height="44" class="box" rx="6"/><text x="765" y="58" text-anchor="middle" class="title">CLOSE body</text><text x="765" y="74" text-anchor="middle" class="label">FileId = FF..FF</text>
+  <text x="130" y="110" text-anchor="middle" class="label">NextCommand →</text><text x="390" y="110" text-anchor="middle" class="label">NextCommand →</text><text x="660" y="110" text-anchor="middle" class="label">NextCommand = 0</text>
+  <text x="20" y="150" class="title">Each message is signed individually (HMAC-SHA256 or AES-CMAC over header+body, signature field zeroed).</text>
+  <rect x="20" y="175" width="60" height="44" class="box" rx="6"/><text x="50" y="193" text-anchor="middle" class="title">4 B</text><text x="50" y="209" text-anchor="middle" class="label">len</text>
+  <rect x="80" y="175" width="150" height="44" class="box c" rx="6"/><text x="155" y="193" text-anchor="middle" class="title">Transform header</text><text x="155" y="209" text-anchor="middle" class="label">52 B: nonce, size, session</text>
+  <rect x="230" y="175" width="590" height="44" class="box" rx="6"/><text x="525" y="193" text-anchor="middle" class="title">AES-128-GCM/CCM ciphertext of the whole chain above</text><text x="525" y="209" text-anchor="middle" class="label">tag in the transform header, AAD = header bytes 20..52</text>
+  <text x="20" y="250" class="label">Encrypted frames replace signing. Nonces are a 64-bit counter plus random bytes and never repeat for a session key.</text>
+</svg>

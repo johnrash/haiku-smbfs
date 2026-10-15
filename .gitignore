@@ -1,0 +1,6 @@
+# Build outputs
+objects/
+objects.*/
+*.o
+*.hpkg
+package/pkg/

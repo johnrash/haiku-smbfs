@@ -1,0 +1,19 @@
+name			smbfs
+version			1.0.0-5
+architecture	x86_64
+summary			"SMB2/SMB3 network file system client"
+description		"Native Haiku kernel file system add-on for mounting SMB2 and SMB3 shares from Windows, Samba and other servers. Includes the mount_smbfs command line tool and SMBMounter, a graphical mounter that is also available from Tracker's add-ons menu and the Deskbar."
+packager		"HaikuSMB project"
+vendor			"HaikuSMB project"
+copyrights		"2026 HaikuSMB project"
+licenses		"MIT"
+
+provides {
+	smbfs = 1.0.0
+	cmd:mount_smbfs = 1.0.0
+	app:SMBMounter = 1.0.0
+}
+
+requires {
+	haiku >= r1~beta6
+}

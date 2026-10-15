@@ -1,0 +1,5 @@
+These headers mirror Haiku's build/config_headers/kernel_debug_config.h and
+tracing_config.h (MIT licensed, from the Haiku source tree). Private kernel
+headers such as lock.h include them, but they are not shipped in the
+haiku_devel package. KDEBUG_LEVEL is set to 0, which matches the release
+kernel (the in-tree nfs4 add-on imports the non-KDEBUG mutex entry points).

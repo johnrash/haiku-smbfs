@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="230" viewBox="0 0 980 230" role="img" aria-label="Connection state machine">
+  <style>
+  text { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 12px; fill: #1f2328; }
+  .box { fill: #fff; stroke: #57606a; stroke-width: 1.2; }
+  .box.k { fill: #eef5fc; stroke: #0b5cad; }
+  .box.u { fill: #fdf3e2; stroke: #c48a00; }
+  .box.n { fill: #eaf4ea; stroke: #2f7d32; }
+  .box.c { fill: #f3f0fa; stroke: #6a4fb3; }
+  .lane { fill: none; stroke: #d0d7de; stroke-dasharray: 4 4; }
+  .arrow { stroke: #57606a; stroke-width: 1.3; fill: none; marker-end: url(#arr); }
+  .label { fill: #57606a; font-size: 11px; }
+  .title { font-weight: 600; font-size: 13px; }
+</style>
+  <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#57606a"/></marker></defs>
+  <rect width="100%" height="100%" fill="#ffffff"/>
+  <rect x="20" y="80" width="130" height="50" class="box" rx="6"/><text x="85" y="109" text-anchor="middle" class="title">Disconnected</text>
+  <rect x="200" y="80" width="130" height="50" class="box c" rx="6"/><text x="265" y="102" text-anchor="middle" class="title">TCP connected</text><text x="265" y="118" text-anchor="middle" class="label">sa_len set, TCP_NODELAY</text>
+  <rect x="380" y="80" width="130" height="50" class="box c" rx="6"/><text x="445" y="102" text-anchor="middle" class="title">Negotiated</text><text x="445" y="118" text-anchor="middle" class="label">dialect, sizes, contexts</text>
+  <rect x="560" y="80" width="130" height="50" class="box c" rx="6"/><text x="625" y="102" text-anchor="middle" class="title">Session</text><text x="625" y="118" text-anchor="middle" class="label">NTLMv2, keys derived</text>
+  <rect x="740" y="80" width="130" height="50" class="box n" rx="6"/><text x="805" y="102" text-anchor="middle" class="title">Tree connected</text><text x="805" y="118" text-anchor="middle" class="label">share flags, max access</text>
+  <path d="M150 105 L200 105" class="arrow"/><path d="M330 105 L380 105" class="arrow"/><path d="M510 105 L560 105" class="arrow"/><path d="M690 105 L740 105" class="arrow"/>
+  <path d="M805 130 L805 180 L85 180 L85 130" class="arrow"/>
+  <text x="445" y="196" text-anchor="middle" class="label">send/recv error, timeout, socket closed by the server, STATUS_USER_SESSION_DELETED, ... → Disconnect()</text>
+  <text x="445" y="212" text-anchor="middle" class="label">the next operation reconnects (Generation()++) and open cookies transparently reopen their handles</text>
+  <text x="85" y="60" text-anchor="middle" class="label">Connect() / _EnsureConnected()</text>
+</svg>

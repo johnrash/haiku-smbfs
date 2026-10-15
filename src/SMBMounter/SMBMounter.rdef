@@ -1,0 +1,16 @@
+resource app_signature "application/x-vnd.HaikuSMB-SMBMounter";
+
+resource app_flags B_SINGLE_LAUNCH;
+
+resource app_version {
+	major  = 1,
+	middle = 0,
+	minor  = 0,
+	variety = B_APPV_BETA,
+	internal = 1,
+	short_info = "SMBMounter",
+	long_info = "Mounts SMB network shares using the smbfs file system."
+};
+
+/* Application icon (HVIF, exported from Icon-O-Matic). */
+resource(101, "BEOS:ICON") #'VICN' import "SMBMounter.hvif";
