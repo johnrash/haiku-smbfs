@@ -2,8 +2,8 @@
  * Copyright 2026, Haiku SMB project.
  * Distributed under the terms of the MIT License.
  *
- * Thin platform abstraction: logging, time, randomness, locking. The
- * implementation differs between the Haiku kernel and userland.
+ * Thin platform abstraction: logging, time, randomness, locking, threads.
+ * The implementation differs between the Haiku kernel and userland.
  */
 #ifndef SMB2_PLATFORM_H
 #define SMB2_PLATFORM_H
@@ -52,6 +52,9 @@ void Snooze(bigtime_t microseconds);
 // Current effective uid/gid (used for stat information).
 uint32 CurrentUserID();
 uint32 CurrentGroupID();
+
+// The number of CPUs.
+int32 CpuCount();
 
 
 class Mutex {
@@ -114,6 +117,53 @@ public:
 private:
 			Mutex*				fLock;
 			bool				fLocked;
+};
+
+
+// A counting semaphore.
+class Semaphore {
+public:
+								Semaphore(const char* name);
+								~Semaphore();
+
+			status_t			InitCheck() const;
+			void				Acquire();
+			void				Release();
+
+private:
+#ifdef _KERNEL_MODE
+			sem_id				fSemaphore;
+#else
+			pthread_mutex_t		fLock;
+			pthread_cond_t		fCondition;
+			int32				fCount;
+#endif
+};
+
+
+// A thread running function(data) until it returns; Join() waits for it.
+class Thread {
+public:
+	typedef void (*Function)(void* data);
+
+								Thread();
+								~Thread();
+
+			status_t			Start(const char* name, Function function,
+									void* data);
+			void				Join();
+
+private:
+#ifdef _KERNEL_MODE
+	static	int32				_Entry(void* data);
+			thread_id			fThread;
+#else
+	static	void*				_Entry(void* data);
+			pthread_t			fThread;
+			bool				fStarted;
+#endif
+			Function			fFunction;
+			void*				fData;
 };
 
 

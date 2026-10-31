@@ -61,6 +61,8 @@ enum {
 	kMsgUnmount			= 'umnt',
 	kMsgShareChanged	= 'shch',
 	kMsgSelectionChanged = 'selc',
+	kMsgSignChanged = 'sgnc',
+	kMsgNoSignChanged = 'nsgc',
 	kMsgRefresh			= 'rfsh',
 
 	// favorites
@@ -224,6 +226,7 @@ struct Favorite {
 	BString	domain;
 	BString	mountPoint;
 	bool	sign;
+	bool	noSign;
 	bool	seal;
 	bool	readOnly;
 	bool	remember;
@@ -231,6 +234,7 @@ struct Favorite {
 	Favorite()
 		:
 		sign(false),
+		noSign(false),
 		seal(false),
 		readOnly(false),
 		remember(false)
@@ -247,6 +251,7 @@ struct Favorite {
 		into.AddString("domain", domain);
 		into.AddString("mountpoint", mountPoint);
 		into.AddBool("sign", sign);
+		into.AddBool("nosign", noSign);
 		into.AddBool("seal", seal);
 		into.AddBool("readonly", readOnly);
 		into.AddBool("remember", remember);
@@ -263,6 +268,7 @@ struct Favorite {
 		from.FindString("domain", &domain);
 		from.FindString("mountpoint", &mountPoint);
 		from.FindBool("sign", &sign);
+		from.FindBool("nosign", &noSign);
 		from.FindBool("seal", &seal);
 		from.FindBool("readonly", &readOnly);
 		from.FindBool("remember", &remember);
@@ -470,6 +476,7 @@ private:
 			BTextControl*		fMountPoint;
 			BCheckBox*			fRemember;
 			BCheckBox*			fSign;
+			BCheckBox*			fNoSign;
 			BCheckBox*			fSeal;
 			BCheckBox*			fReadOnly;
 			BButton*			fMountButton;
@@ -499,7 +506,12 @@ MounterWindow::MounterWindow()
 	fDomain = new BTextControl("domain", "Domain:", "", NULL);
 	fMountPoint = new BTextControl("mountpoint", "Mount at:", "", NULL);
 	fRemember = new BCheckBox("remember", "Remember password", NULL);
-	fSign = new BCheckBox("sign", "Require signing", NULL);
+	fSign = new BCheckBox("sign", "Require signing",
+		new BMessage(kMsgSignChanged));
+	fNoSign = new BCheckBox("nosign", "Skip signing",
+		new BMessage(kMsgNoSignChanged));
+	fNoSign->SetToolTip("Sign only if the server requires it: faster, for "
+		"trusted networks");
 	fSeal = new BCheckBox("seal", "Encrypt traffic", NULL);
 	fReadOnly = new BCheckBox("readonly", "Read-only", NULL);
 	fMountButton = new BButton("mount", "Mount", new BMessage(kMsgMount));
@@ -560,6 +572,7 @@ MounterWindow::MounterWindow()
 			.End()
 			.AddGroup(B_HORIZONTAL)
 				.Add(fSign)
+				.Add(fNoSign)
 				.Add(fSeal)
 				.Add(fReadOnly)
 				.AddGlue()
@@ -624,9 +637,13 @@ MounterWindow::SetField(const char* key, const char* value)
 	else if (strcmp(key, "mountpoint") == 0) {
 		fMountPoint->SetText(value);
 		fMountPointEdited = value[0] != '\0';
-	} else if (strcmp(key, "sign") == 0)
+	} else if (strcmp(key, "sign") == 0) {
 		fSign->SetValue(B_CONTROL_ON);
-	else if (strcmp(key, "seal") == 0)
+		fNoSign->SetValue(B_CONTROL_OFF);
+	} else if (strcmp(key, "nosign") == 0) {
+		fNoSign->SetValue(B_CONTROL_ON);
+		fSign->SetValue(B_CONTROL_OFF);
+	} else if (strcmp(key, "seal") == 0)
 		fSeal->SetValue(B_CONTROL_ON);
 	else if (strcmp(key, "ro") == 0)
 		fReadOnly->SetValue(B_CONTROL_ON);
@@ -662,6 +679,17 @@ MounterWindow::MessageReceived(BMessage* message)
 		case kMsgUnmount:
 			_Unmount();
 			break;
+		case kMsgSignChanged:
+			// "Require signing" and "Skip signing" exclude each other
+			if (fSign->Value() == B_CONTROL_ON)
+				fNoSign->SetValue(B_CONTROL_OFF);
+			break;
+
+		case kMsgNoSignChanged:
+			if (fNoSign->Value() == B_CONTROL_ON)
+				fSign->SetValue(B_CONTROL_OFF);
+			break;
+
 		case kMsgShareChanged:
 			// Setting the share text programmatically also posts this
 			// message; only recompute when the share really changed, so
@@ -935,6 +963,8 @@ MounterWindow::_Mount()
 		parameters << " domain=" << quote_value(fDomain->Text());
 	if (fSign->Value() == B_CONTROL_ON)
 		parameters << " sign";
+	else if (fNoSign->Value() == B_CONTROL_ON)
+		parameters << " nosign";
 	if (fSeal->Value() == B_CONTROL_ON)
 		parameters << " seal";
 
@@ -1165,6 +1195,7 @@ MounterWindow::_CurrentFavorite(Favorite& favorite) const
 	if (favorite.mountPoint == defaultMountPoint)
 		favorite.mountPoint = "";
 	favorite.sign = fSign->Value() == B_CONTROL_ON;
+	favorite.noSign = fNoSign->Value() == B_CONTROL_ON;
 	favorite.seal = fSeal->Value() == B_CONTROL_ON;
 	favorite.readOnly = fReadOnly->Value() == B_CONTROL_ON;
 	favorite.remember = fRemember->Value() == B_CONTROL_ON;
@@ -1201,6 +1232,8 @@ MounterWindow::_ApplyFavorite(const Favorite& favorite)
 		fPasswordFromKeyStore = false;
 	}
 	fSign->SetValue(favorite.sign ? B_CONTROL_ON : B_CONTROL_OFF);
+	fNoSign->SetValue(favorite.noSign && !favorite.sign
+		? B_CONTROL_ON : B_CONTROL_OFF);
 	fSeal->SetValue(favorite.seal ? B_CONTROL_ON : B_CONTROL_OFF);
 	fReadOnly->SetValue(favorite.readOnly ? B_CONTROL_ON : B_CONTROL_OFF);
 	fRemember->SetValue(favorite.remember ? B_CONTROL_ON : B_CONTROL_OFF);
@@ -1309,6 +1342,10 @@ MounterWindow::_LoadSettings()
 	bool flag;
 	if (settings.FindBool("sign", &flag) == B_OK)
 		fSign->SetValue(flag ? B_CONTROL_ON : B_CONTROL_OFF);
+	if (settings.FindBool("nosign", &flag) == B_OK
+		&& fSign->Value() != B_CONTROL_ON) {
+		fNoSign->SetValue(flag ? B_CONTROL_ON : B_CONTROL_OFF);
+	}
 	if (settings.FindBool("seal", &flag) == B_OK)
 		fSeal->SetValue(flag ? B_CONTROL_ON : B_CONTROL_OFF);
 	if (settings.FindBool("readonly", &flag) == B_OK)
@@ -1341,6 +1378,7 @@ MounterWindow::_SaveSettings()
 	settings.AddString("mountpoint",
 		defaultMountPoint == fMountPoint->Text() ? "" : fMountPoint->Text());
 	settings.AddBool("sign", fSign->Value() == B_CONTROL_ON);
+	settings.AddBool("nosign", fNoSign->Value() == B_CONTROL_ON);
 	settings.AddBool("seal", fSeal->Value() == B_CONTROL_ON);
 	settings.AddBool("readonly", fReadOnly->Value() == B_CONTROL_ON);
 	settings.AddBool("remember", fRemember->Value() == B_CONTROL_ON);

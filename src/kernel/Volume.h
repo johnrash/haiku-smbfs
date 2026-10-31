@@ -29,12 +29,14 @@ struct MountOptions {
 	mode_t				fileMode;
 	mode_t				directoryMode;
 	bool				sign;
+	bool				noSign;
 	bool				seal;
 	bool				readOnly;
 	uint16				minDialect;
 	uint16				maxDialect;
 	bigtime_t			cacheTimeout;
 	bigtime_t			requestTimeout;
+	uint32				readAhead;		// bytes; 0: off
 	bool				trace;
 };
 

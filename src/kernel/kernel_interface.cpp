@@ -194,6 +194,11 @@ smbfs_unmount(fs_volume* fsVolume)
 {
 	GET_VOLUME(fsVolume, (fs_vnode*)NULL, B_OK);
 	TRACE("unmount\n");
+	// Release the reference to the root vnode that publish_vnode() in
+	// smbfs_mount() gave us, as other file systems do: the VFS only frees the
+	// root when it is gone (a debug kernel asserts that no vnode is left once
+	// unmount returns; a release kernel leaks it).
+	put_vnode(fsVolume, volume->Root()->ID());
 	volume->Unmount();
 	unregister_volume(volume);
 	return B_OK;

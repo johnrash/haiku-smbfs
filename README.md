@@ -22,7 +22,9 @@ C++ under the MIT license.
 - NTLMv2 authentication (with MIC), guest/anonymous sessions.
 - Message signing: HMAC-SHA256 (SMB 2.x) and AES-128-CMAC (SMB 3.x), with
   SMB 3.1.1 pre-authentication integrity. Signing is used whenever the
-  server requires it, for all SMB 3.1.1 sessions, or when requested.
+  server requires it, for all SMB 3.1.1 sessions, or when requested; the
+  `nosign` option limits it to what the server requires (faster on CPUs
+  without AES instructions, for trusted networks).
 - Encryption: AES-128-GCM and AES-128-CCM (SMB 3.x), used when the server or
   share requires it or when requested with the `seal` option.
 - Compounded requests for path operations (one network round trip for stat,
@@ -70,7 +72,8 @@ share called `dev` is mounted at `/dev1`, never over `/dev`). Mount points
 must be empty directories; system directories are refused. Use
 `unmount /HaikuSMB` to unmount it again. Run
 `mount_smbfs --help` for all options (`-r` read-only, `-s` require signing,
-`-e` require encryption, `-d domain`, `-o "extra options"`).
+`-N` sign only if the server requires it, `-e` require encryption,
+`-d domain`, `-o "extra options"`).
 
 The standard `mount` command works too; all settings are passed with `-p`:
 
@@ -91,6 +94,7 @@ Options are separated by spaces. Values containing spaces can be quoted.
 | `domain=DOMAIN`    | Domain or workgroup (optional). |
 | `port=N`           | TCP port (default 445). |
 | `sign`             | Require message signing. |
+| `nosign`           | Sign only what the server requires (otherwise every SMB 3.1.1 message is signed). Faster where signing costs CPU time (ARM boards without AES instructions); the negotiation stays protected, but the data isn't protected against tampering on the network. |
 | `seal`             | Require encryption (needs SMB 3.x on the server). |
 | `ro`               | Mount read-only (`mount -ro` does the same). |
 | `vers=X`           | Highest dialect to use: `2.0.2`, `2.1`, `3.0`, `3.0.2` or `3.1.1` (default). `mindialect=X` sets the lowest. |
@@ -98,6 +102,7 @@ Options are separated by spaces. Values containing spaces can be quoted.
 | `exec`             | Show files as executable (`rwxr-xr-x`), e.g. to run programs from the share. By default files are `rw-r--r--` and directories `rwxr-xr-x`. |
 | `fmask=OCT`, `dmask=OCT` | Permission bits to remove from files/directories. `file_mode=`/`dir_mode=` set the modes directly (e.g. `file_mode=0755`). |
 | `cache=SECONDS`    | Attribute cache timeout (default 2; 0 disables caching). |
+| `readahead=KIB`    | Largest read-ahead window for sequential reads (default 1024; 0 turns read-ahead off). |
 | `timeout=SECONDS`  | Network request timeout (default 30). |
 | `trace`            | Log protocol details to the syslog. |
 

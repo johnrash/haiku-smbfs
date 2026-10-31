@@ -143,6 +143,100 @@ CurrentGroupID()
 }
 
 
+int32
+CpuCount()
+{
+	system_info info;
+	if (get_system_info(&info) != B_OK || info.cpu_count < 1)
+		return 1;
+	return (int32)info.cpu_count;
+}
+
+
+Semaphore::Semaphore(const char* name)
+	:
+	fSemaphore(create_sem(0, name))
+{
+}
+
+
+Semaphore::~Semaphore()
+{
+	if (fSemaphore >= 0)
+		delete_sem(fSemaphore);
+}
+
+
+status_t
+Semaphore::InitCheck() const
+{
+	return fSemaphore >= 0 ? B_OK : fSemaphore;
+}
+
+
+void
+Semaphore::Acquire()
+{
+	while (acquire_sem(fSemaphore) == B_INTERRUPTED)
+		;
+}
+
+
+void
+Semaphore::Release()
+{
+	release_sem(fSemaphore);
+}
+
+
+Thread::Thread()
+	:
+	fThread(-1),
+	fFunction(NULL),
+	fData(NULL)
+{
+}
+
+
+Thread::~Thread()
+{
+	Join();
+}
+
+
+/*static*/ int32
+Thread::_Entry(void* data)
+{
+	Thread* thread = (Thread*)data;
+	thread->fFunction(thread->fData);
+	return 0;
+}
+
+
+status_t
+Thread::Start(const char* name, Function function, void* data)
+{
+	fFunction = function;
+	fData = data;
+	fThread = spawn_kernel_thread(&_Entry, name, B_NORMAL_PRIORITY, this);
+	if (fThread < 0)
+		return fThread;
+	resume_thread(fThread);
+	return B_OK;
+}
+
+
+void
+Thread::Join()
+{
+	if (fThread < 0)
+		return;
+	status_t result;
+	wait_for_thread(fThread, &result);
+	fThread = -1;
+}
+
+
 Mutex::Mutex(const char* name)
 {
 	mutex_init(&fLock, name);
@@ -276,6 +370,106 @@ uint32
 CurrentGroupID()
 {
 	return getegid();
+}
+
+
+int32
+CpuCount()
+{
+	long count = sysconf(_SC_NPROCESSORS_ONLN);
+	return count > 0 ? (int32)count : 1;
+}
+
+
+Semaphore::Semaphore(const char* name)
+	:
+	fCount(0)
+{
+	(void)name;
+	pthread_mutex_init(&fLock, NULL);
+	pthread_cond_init(&fCondition, NULL);
+}
+
+
+Semaphore::~Semaphore()
+{
+	pthread_cond_destroy(&fCondition);
+	pthread_mutex_destroy(&fLock);
+}
+
+
+status_t
+Semaphore::InitCheck() const
+{
+	return B_OK;
+}
+
+
+void
+Semaphore::Acquire()
+{
+	pthread_mutex_lock(&fLock);
+	while (fCount == 0)
+		pthread_cond_wait(&fCondition, &fLock);
+	fCount--;
+	pthread_mutex_unlock(&fLock);
+}
+
+
+void
+Semaphore::Release()
+{
+	pthread_mutex_lock(&fLock);
+	fCount++;
+	pthread_cond_signal(&fCondition);
+	pthread_mutex_unlock(&fLock);
+}
+
+
+Thread::Thread()
+	:
+	fStarted(false),
+	fFunction(NULL),
+	fData(NULL)
+{
+}
+
+
+Thread::~Thread()
+{
+	Join();
+}
+
+
+/*static*/ void*
+Thread::_Entry(void* data)
+{
+	Thread* thread = (Thread*)data;
+	thread->fFunction(thread->fData);
+	return NULL;
+}
+
+
+status_t
+Thread::Start(const char* name, Function function, void* data)
+{
+	(void)name;
+	fFunction = function;
+	fData = data;
+	if (pthread_create(&fThread, NULL, &_Entry, this) != 0)
+		return B_NO_MEMORY;
+	fStarted = true;
+	return B_OK;
+}
+
+
+void
+Thread::Join()
+{
+	if (!fStarted)
+		return;
+	pthread_join(fThread, NULL);
+	fStarted = false;
 }
 
 

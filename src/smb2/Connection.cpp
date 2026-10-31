@@ -31,6 +31,8 @@ namespace smb2 {
 
 
 static const uint32 kDesiredCredits = 64;
+static const size_t kPipelineChunk = 256 * 1024;
+static const int kMaxPipeline = 8;
 static const uint32 kMaxCreditRequest = 256;
 static const int kMaxFramesPerCall = 32;
 
@@ -46,6 +48,8 @@ struct Connection::Request {
 	uint16				command;
 	uint16				creditCharge;
 	Packet				body;
+	Packet				frame;
+		// a pipelined request's own frame, signed on the other CPUs
 
 	uint64				messageId;
 	uint32				status;
@@ -73,6 +77,273 @@ struct Connection::Frame {
 	uint8*				data;
 	size_t				length;
 	bool				primary;
+};
+
+
+// A message's signature (its signature field zeroed): AES-CMAC for SMB 3,
+// HMAC-SHA256 for SMB 2.
+static void
+compute_signature(uint16 dialect, const uint8* key, const uint8* message,
+	size_t length, uint8 signature[16])
+{
+	if (dialect >= SMB2_DIALECT_300) {
+		crypto::AESCMAC cmac;
+		cmac.Init(key);
+		cmac.Update(message, length);
+		cmac.Final(signature);
+	} else {
+		uint8 mac[32];
+		crypto::hmac_sha256(key, 16, message, length, mac);
+		memcpy(signature, mac, 16);
+	}
+}
+
+
+// Whether a message's signature is right. The field is zeroed for the
+// check, then put back.
+static bool
+check_signature(uint16 dialect, const uint8* key, uint8* message,
+	size_t length)
+{
+	if (length < kHeaderSize)
+		return false;
+	uint8 saved[16];
+	memcpy(saved, message + 48, 16);
+	memset(message + 48, 0, 16);
+	uint8 computed[16];
+	compute_signature(dialect, key, message, length, computed);
+	memcpy(message + 48, saved, 16);
+	return crypto::secure_equals(saved, computed, 16);
+}
+
+
+// Signs pipelined requests, and checks the signatures of their responses
+// while the connection's thread receives the next ones, on the other CPUs.
+// Every SMB 3.1.1 message is signed, and AES-CMAC in software runs at
+// about 60 MB/s on a Cortex-A53: one CPU's worth is the limit otherwise.
+// The jobs point into the frames, which must stay until Finish() returns.
+class Connection::Verifier {
+public:
+	static const int kMaxThreads = 3;
+	static const int kMaxJobs = 32;
+
+	Verifier(Connection* connection)
+		:
+		fConnection(connection),
+		fLock("smb2 verifier"),
+		fWork("smb2 verifier work"),
+		fIdle("smb2 verifier idle"),
+		fQueue(NULL),
+		fQueueTail(NULL),
+		fJobCount(0),
+		fPending(0),
+		fWaiting(false),
+		fQuit(false),
+		fThreadCount(0),
+		fDialect(0)
+	{
+		memset(fKey, 0, sizeof(fKey));
+	}
+
+	~Verifier()
+	{
+		{
+			MutexLocker locker(fLock);
+			fQuit = true;
+		}
+		for (int i = 0; i < fThreadCount; i++)
+			fWork.Release();
+		for (int i = 0; i < fThreadCount; i++)
+			fThreads[i].Join();
+		memset(fKey, 0, sizeof(fKey));
+	}
+
+	status_t Init(int threads)
+	{
+		if (fWork.InitCheck() != B_OK || fIdle.InitCheck() != B_OK)
+			return B_NO_MEMORY;
+		for (int i = 0; i < threads && i < kMaxThreads; i++) {
+			if (fThreads[i].Start("smb2 signature checker", &_Run, this)
+					!= B_OK) {
+				break;
+			}
+			fThreadCount++;
+		}
+		return fThreadCount > 0 ? B_OK : B_ERROR;
+	}
+
+	// A batch: the key and dialect of its messages.
+	void Begin(uint16 dialect, const uint8 key[16])
+	{
+		fDialect = dialect;
+		memcpy(fKey, key, sizeof(fKey));
+		fJobCount = 0;
+		fFailed = false;
+	}
+
+	// A message to check, or with "sign" to sign (its flags set and its
+	// signature field zeroed already). false: no room; do it yourself.
+	bool Submit(uint8* message, size_t length, bool sign = false)
+	{
+		Job* job = _NewJob(sign ? kSign : kVerify);
+		if (job == NULL)
+			return false;
+		job->message = message;
+		job->length = length;
+		_Queue(job);
+		return true;
+	}
+
+	// A frame to seal with that nonce counter value, or a received one to
+	// open (in place).
+	bool SubmitSeal(Packet* frame, uint64 nonceValue)
+	{
+		Job* job = _NewJob(kSeal);
+		if (job == NULL)
+			return false;
+		job->packet = frame;
+		job->nonce = nonceValue;
+		_Queue(job);
+		return true;
+	}
+
+	bool SubmitUnseal(Frame* frame)
+	{
+		Job* job = _NewJob(kUnseal);
+		if (job == NULL)
+			return false;
+		job->frame = frame;
+		_Queue(job);
+		return true;
+	}
+
+private:
+	enum { kVerify, kSign, kSeal, kUnseal };
+
+	struct Job {
+		int			kind;
+		uint8*		message;
+		size_t		length;
+		Packet*		packet;
+		uint64		nonce;
+		Frame*		frame;
+		Job*		next;
+	};
+
+	Job* _NewJob(int kind)
+	{
+		if (fJobCount >= kMaxJobs)
+			return NULL;
+		Job* job = &fJobs[fJobCount++];
+		memset(job, 0, sizeof(*job));
+		job->kind = kind;
+		return job;
+	}
+
+	void _Queue(Job* job)
+	{
+		{
+			MutexLocker locker(fLock);
+			if (fQueueTail != NULL)
+				fQueueTail->next = job;
+			else
+				fQueue = job;
+			fQueueTail = job;
+			fPending++;
+		}
+		fWork.Release();
+	}
+
+public:
+	// Does what is still queued, waits for the rest; true if all the
+	// signatures checked were right, and the frames sealed and opened.
+	bool Finish()
+	{
+		while (_RunOne())
+			;
+		MutexLocker locker(fLock);
+		while (fPending > 0) {
+			fWaiting = true;
+			locker.Unlock();
+			fIdle.Acquire();
+			locker.Lock();
+		}
+		fWaiting = false;
+		fJobCount = 0;
+		return !fFailed;
+	}
+
+private:
+	static void _Run(void* data)
+	{
+		Verifier* verifier = (Verifier*)data;
+		while (true) {
+			verifier->fWork.Acquire();
+			{
+				MutexLocker locker(verifier->fLock);
+				if (verifier->fQuit)
+					return;
+			}
+			verifier->_RunOne();
+		}
+	}
+
+	bool _RunOne()
+	{
+		Job* job;
+		{
+			MutexLocker locker(fLock);
+			job = fQueue;
+			if (job == NULL)
+				return false;
+			fQueue = job->next;
+			if (fQueue == NULL)
+				fQueueTail = NULL;
+		}
+		bool valid = true;
+		switch (job->kind) {
+			case kSign:
+				compute_signature(fDialect, fKey, job->message, job->length,
+					job->message + 48);
+				break;
+			case kVerify:
+				valid = check_signature(fDialect, fKey, job->message,
+					job->length);
+				break;
+			case kSeal:
+				valid = fConnection->_EncryptFrame(*job->packet, job->nonce)
+					== B_OK;
+				break;
+			case kUnseal:
+				valid = fConnection->_DecryptFrame(*job->frame) == B_OK;
+				break;
+		}
+		MutexLocker locker(fLock);
+		if (!valid)
+			fFailed = true;
+		if (--fPending == 0 && fWaiting) {
+			fWaiting = false;
+			fIdle.Release();
+		}
+		return true;
+	}
+
+	Connection*	fConnection;
+	Mutex		fLock;
+	Semaphore	fWork;
+	Semaphore	fIdle;
+	Job*		fQueue;
+	Job*		fQueueTail;
+	Job			fJobs[kMaxJobs];
+	int			fJobCount;
+	int			fPending;
+	bool		fWaiting;
+	bool		fFailed;
+	bool		fQuit;
+	Thread		fThreads[kMaxThreads];
+	int			fThreadCount;
+	uint16		fDialect;
+	uint8		fKey[16];
 };
 
 
@@ -209,7 +480,10 @@ Connection::Connection()
 	fReceiveBufferInUse(false),
 	fFrames(NULL),
 	fFrameCount(0),
-	fFrameCapacity(0)
+	fFrameCapacity(0),
+	fVerifier(NULL),
+	fVerifierTried(false),
+	fDeferVerify(false)
 {
 	fHost[0] = '\0';
 	fShare[0] = '\0';
@@ -228,6 +502,7 @@ Connection::Connection()
 Connection::~Connection()
 {
 	Disconnect();
+	delete fVerifier;
 	_FreeFrames();
 	free(fFrames);
 	free(fReceiveBuffer);
@@ -643,48 +918,53 @@ Connection::_SignMessage(uint8* message, size_t length)
 	uint32 flags = LoadLE32(message + 16) | SMB2_FLAGS_SIGNED;
 	StoreLE32(message + 16, flags);
 	memset(message + 48, 0, 16);
-
-	if (fDialect >= SMB2_DIALECT_300) {
-		fSigningCmac.Init(fSigningKey);
-		fSigningCmac.Update(message, length);
-		fSigningCmac.Final(message + 48);
-	} else {
-		uint8 mac[32];
-		crypto::hmac_sha256(fSigningKey, 16, message, length, mac);
-		memcpy(message + 48, mac, 16);
-	}
+	compute_signature(fDialect, fSigningKey, message, length, message + 48);
 }
 
 
 bool
 Connection::_VerifyMessage(const uint8* message, size_t length)
 {
-	if (length < kHeaderSize)
-		return false;
+	return check_signature(fDialect, fSigningKey, const_cast<uint8*>(message),
+		length);
+}
 
-	uint8 saved[16];
-	memcpy(saved, message + 48, 16);
-	uint8* mutableMessage = const_cast<uint8*>(message);
-	memset(mutableMessage + 48, 0, 16);
 
-	uint8 computed[32];
-	if (fDialect >= SMB2_DIALECT_300) {
-		fSigningCmac.Init(fSigningKey);
-		fSigningCmac.Update(message, length);
-		fSigningCmac.Final(computed);
-	} else
-		crypto::hmac_sha256(fSigningKey, 16, message, length, computed);
-
-	memcpy(mutableMessage + 48, saved, 16);
-	return crypto::secure_equals(saved, computed, 16);
+// The signature checkers, started the first time they can help: with
+// more than one CPU.
+Connection::Verifier*
+Connection::_GetVerifier()
+{
+	if (fVerifier == NULL && !fVerifierTried) {
+		fVerifierTried = true;
+		int32 cpus = CpuCount();
+		if (cpus > 1) {
+			Verifier* verifier = new(std::nothrow) Verifier(this);
+			if (verifier != NULL && verifier->Init(cpus - 1) == B_OK)
+				fVerifier = verifier;
+			else
+				delete verifier;
+		}
+	}
+	return fVerifier;
 }
 
 
 status_t
 Connection::_EncryptSendBuffer()
 {
-	// fSendBuffer: 4 byte transport header + plaintext message(s)
-	size_t plainLength = fSendBuffer.Length() - 4;
+	return _EncryptFrame(fSendBuffer, ++fNonceCounter);
+}
+
+
+/*!	Seals a frame (4 byte transport header + plaintext message(s)) with the
+	given nonce counter value. Uses only the session's keys: the signature
+	threads run it for pipelined requests (see Verifier).
+*/
+status_t
+Connection::_EncryptFrame(Packet& frame, uint64 nonceValue) const
+{
+	size_t plainLength = frame.Length() - 4;
 	Packet encrypted;
 	if (!encrypted.Reserve(4 + kTransformHeaderSize + plainLength))
 		return B_NO_MEMORY;
@@ -705,7 +985,7 @@ Connection::_EncryptSendBuffer()
 	// nonce
 	uint8 nonce[16];
 	memset(nonce, 0, sizeof(nonce));
-	StoreLE64(nonce, ++fNonceCounter);
+	StoreLE64(nonce, nonceValue);
 	size_t nonceLength = fCipher == SMB2_ENCRYPTION_AES128_GCM ? 12 : 11;
 	memcpy(nonce + 8, fNonceRandom, nonceLength - 8);
 	memcpy(header + 20, nonce, 16);
@@ -713,7 +993,7 @@ Connection::_EncryptSendBuffer()
 	StoreLE16(header + 42, 0x0001);
 	StoreLE64(header + 44, fSessionId);
 
-	const uint8* plain = fSendBuffer.Data() + 4;
+	const uint8* plain = frame.Data() + 4;
 	uint8* cipher = header + kTransformHeaderSize;
 	if (fCipher == SMB2_ENCRYPTION_AES128_GCM) {
 		crypto::aes_gcm_encrypt(fEncryptionKey, nonce, header + 20, 32, plain,
@@ -723,9 +1003,9 @@ Connection::_EncryptSendBuffer()
 			plainLength, cipher, header + 4);
 	}
 
-	fSendBuffer.Reset();
-	fSendBuffer.PutBytes(encrypted.Data(), encrypted.Length());
-	return fSendBuffer.Failed() ? B_NO_MEMORY : B_OK;
+	frame.Reset();
+	frame.PutBytes(encrypted.Data(), encrypted.Length());
+	return frame.Failed() ? B_NO_MEMORY : B_OK;
 }
 
 
@@ -814,32 +1094,16 @@ Connection::_FillHeader(uint8* header, const Request& request, uint32 flags,
 }
 
 
+// Builds the frame of a request or compound into "frame", and with
+// "finish" signs it, or with encryption seals it. Otherwise the messages to
+// sign are only marked so, their signature field zeroed, and a frame to
+// seal stays plain: the caller does it (see Verifier).
 status_t
-Connection::_SendReceive(Request* requests, int count)
+Connection::_BuildFrame(Request* requests, int count, Packet& frame,
+	bool finish)
 {
-	if (fSocket < 0)
-		return SMB2_DISCONNECTED;
-
-	_FreeFrames();
-
-	// Assign message ids and check credits.
-	uint32 totalCharge = 0;
-	for (int i = 0; i < count; i++) {
-		uint16 charge = requests[i].creditCharge;
-		if (!fSupportsMultiCredit)
-			charge = _CreditCharge(0);
-		requests[i].creditCharge = charge;
-		totalCharge += charge > 0 ? charge : 1;
-	}
-	if ((int32)totalCharge > fCredits) {
-		Log("insufficient credits (%ld available, %lu needed)\n",
-			(long)fCredits, (unsigned long)totalCharge);
-		return B_BUSY;
-	}
-
-	// Build the frame.
-	fSendBuffer.Reset();
-	fSendBuffer.PutZeros(4);
+	frame.Reset();
+	frame.PutZeros(4);
 	size_t headerOffsets[16];
 	if (count > 16)
 		return B_BAD_VALUE;
@@ -855,16 +1119,16 @@ Connection::_SendReceive(Request* requests, int count)
 
 		// Messages are 8-byte aligned relative to the start of the first
 		// SMB2 header, i.e. after the 4 byte transport length prefix.
-		while ((fSendBuffer.Length() - 4) % 8 != 0)
-			fSendBuffer.PutU8(0);
-		headerOffsets[i] = fSendBuffer.Length();
-		uint8* header = fSendBuffer.Grow(kHeaderSize);
+		while ((frame.Length() - 4) % 8 != 0)
+			frame.PutU8(0);
+		headerOffsets[i] = frame.Length();
+		uint8* header = frame.Grow(kHeaderSize);
 		if (header == NULL)
 			return B_NO_MEMORY;
 		uint32 flags = i > 0 ? SMB2_FLAGS_RELATED_OPERATIONS : 0;
 		_FillHeader(header, request, flags, 0);
-		fSendBuffer.PutBytes(request.body.Data(), request.body.Length());
-		if (fSendBuffer.Failed())
+		frame.PutBytes(request.body.Data(), request.body.Length());
+		if (frame.Failed())
 			return B_NO_MEMORY;
 	}
 
@@ -875,16 +1139,27 @@ Connection::_SendReceive(Request* requests, int count)
 		if (i + 1 < count) {
 			// next header is 8-aligned
 			end = headerOffsets[i + 1];
-			fSendBuffer.SetU32(start + 20, (uint32)(end - start));
+			frame.SetU32(start + 20, (uint32)(end - start));
 		} else
-			end = fSendBuffer.Length();
+			end = frame.Length();
 
-		bool sign = fSigningEnabled && !fEncryptionEnabled;
+		// SMB 3.1.1 servers want a signed TREE_CONNECT also when the other
+		// messages aren't signed ("nosign")
+		bool sign = (fSigningEnabled
+				|| (requests[i].command == SMB2_TREE_CONNECT
+					&& fHaveSessionKey && fDialect == SMB2_DIALECT_311))
+			&& !fEncryptionEnabled;
 		if (sign) {
 			if (requests[i].command == SMB2_SESSION_SETUP && fTreeId == 0)
 				sign = false;
-			if (sign)
-				_SignMessage(fSendBuffer.Data() + start, end - start);
+			if (sign && finish)
+				_SignMessage(frame.Data() + start, end - start);
+			else if (sign) {
+				uint8* message = frame.Data() + start;
+				StoreLE32(message + 16,
+					LoadLE32(message + 16) | SMB2_FLAGS_SIGNED);
+				memset(message + 48, 0, 16);
+			}
 		}
 	}
 
@@ -894,34 +1169,178 @@ Connection::_SendReceive(Request* requests, int count)
 			|| requests[i].command == SMB2_SESSION_SETUP) {
 			size_t start = headerOffsets[i];
 			size_t end = i + 1 < count ? headerOffsets[i + 1]
-				: fSendBuffer.Length();
-			_PreauthUpdate(fSendBuffer.Data() + start, end - start);
+				: frame.Length();
+			_PreauthUpdate(frame.Data() + start, end - start);
 		}
 	}
 
 	if (fEncryptionEnabled) {
-		status_t status = _EncryptSendBuffer();
-		if (status != B_OK)
-			return status;
+		if (finish) {
+			status_t status = _EncryptFrame(frame, ++fNonceCounter);
+			if (status != B_OK)
+				return status;
+		}
 	} else {
-		size_t frameLength = fSendBuffer.Length() - 4;
+		size_t frameLength = frame.Length() - 4;
 		if (frameLength > kMaxFrameSize)
 			return B_BAD_VALUE;
-		uint8* data = fSendBuffer.Data();
+		uint8* data = frame.Data();
 		data[0] = 0;
 		data[1] = (uint8)(frameLength >> 16);
 		data[2] = (uint8)(frameLength >> 8);
 		data[3] = (uint8)frameLength;
 	}
 
-	status_t status = _SendAll(fSendBuffer.Data(), fSendBuffer.Length());
+	return B_OK;
+}
+
+
+// Builds, signs and sends the frame of a request or compound.
+status_t
+Connection::_SendFrame(Request* requests, int count)
+{
+	status_t status = _BuildFrame(requests, count, fSendBuffer, true);
+	if (status != B_OK)
+		return status;
+	status = _SendAll(fSendBuffer.Data(), fSendBuffer.Length());
 	if (status != B_OK) {
 		_CloseTransport();
 		return status;
 	}
+	return B_OK;
+}
 
-	// Receive responses until all requests are answered.
+
+// Sends requests and waits for all responses. A compound (the default) is
+// one frame of related messages. Otherwise every request is a frame of its
+// own, and all are sent before the first response is read: independent
+// requests, which signing, the network and the server then work on at the
+// same time (pipelining, for large reads and writes).
+status_t
+Connection::_SendReceive(Request* requests, int count, bool compound)
+{
+	if (fSocket < 0)
+		return SMB2_DISCONNECTED;
+	if (count < 1 || count > 16)
+		return B_BAD_VALUE;
+
+	_FreeFrames();
+
+	// Check credits for all of them.
+	uint32 totalCharge = 0;
+	for (int i = 0; i < count; i++) {
+		uint16 charge = requests[i].creditCharge;
+		if (!fSupportsMultiCredit)
+			charge = _CreditCharge(0);
+		requests[i].creditCharge = charge;
+		totalCharge += charge > 0 ? charge : 1;
+	}
+	if ((int32)totalCharge > fCredits) {
+		Log("insufficient credits (%ld available, %lu needed)\n",
+			(long)fCredits, (unsigned long)totalCharge);
+		return B_BUSY;
+	}
+
+	// Pipelined requests are signed or sealed, and their responses checked
+	// or opened, on the other CPUs too (see Verifier); all of it before this
+	// returns, on every path.
+	Verifier* verifier = NULL;
+	if (!compound && count > 1 && (fSigningEnabled || fEncryptionEnabled)) {
+		verifier = _GetVerifier();
+		if (verifier != NULL)
+			verifier->Begin(fDialect, fSigningKey);
+	}
+	struct VerifierFinisher {
+		Connection*	connection;
+		Verifier*	verifier;
+		~VerifierFinisher()
+		{
+			if (verifier != NULL)
+				verifier->Finish();
+			connection->fDeferVerify = false;
+		}
+	} finisher = { this, verifier };
+	fDeferVerify = verifier != NULL;
+
+	status_t status;
+	if (compound)
+		status = _SendFrame(requests, count);
+	else if (verifier != NULL) {
+		// every frame built in its own buffer, signed or sealed on all
+		// CPUs (the nonces in order), then sent
+		status = B_OK;
+		for (int i = 0; i < count && status == B_OK; i++) {
+			Packet& frame = requests[i].frame;
+			status = _BuildFrame(&requests[i], 1, frame, false);
+			if (status != B_OK)
+				break;
+			if (fEncryptionEnabled) {
+				uint64 nonceValue = ++fNonceCounter;
+				if (!verifier->SubmitSeal(&frame, nonceValue))
+					status = _EncryptFrame(frame, nonceValue);
+			} else if ((LoadLE32(frame.Data() + 4 + 16) & SMB2_FLAGS_SIGNED)
+					!= 0
+				&& !verifier->Submit(frame.Data() + 4, frame.Length() - 4,
+					true)) {
+				_SignMessage(frame.Data() + 4, frame.Length() - 4);
+			}
+		}
+		if (!verifier->Finish() && status == B_OK)
+			status = B_NO_MEMORY;
+		for (int i = 0; i < count && status == B_OK; i++) {
+			status = _SendAll(requests[i].frame.Data(),
+				requests[i].frame.Length());
+		}
+		if (status != B_OK && fSocket >= 0)
+			_CloseTransport();
+	} else {
+		status = B_OK;
+		for (int i = 0; i < count && status == B_OK; i++)
+			status = _SendFrame(&requests[i], 1);
+		if (status != B_OK && fSocket >= 0) {
+			// responses to the frames sent would follow: start over
+			_CloseTransport();
+		}
+	}
+	if (status != B_OK)
+		return status;
+
+	// Receive responses until all requests are answered. Sealed pipelined
+	// responses, one frame each: all received, opened on all CPUs, then
+	// read.
 	int remaining = count;
+	if (verifier != NULL && fEncryptionEnabled) {
+		int first = fFrameCount;
+		for (int i = 0; i < count; i++) {
+			Frame& frame = fFrames[fFrameCount];
+			status = _ReceiveFrame(frame);
+			if (status != B_OK) {
+				_CloseTransport();
+				return status;
+			}
+			fFrameCount++;
+			if (frame.length >= 4
+				&& memcmp(frame.data, kTransformId, 4) == 0
+				&& !verifier->SubmitUnseal(&frame)) {
+				status = _DecryptFrame(frame);
+				if (status != B_OK) {
+					_CloseTransport();
+					return status;
+				}
+			}
+		}
+		if (!verifier->Finish()) {
+			_CloseTransport();
+			return B_BAD_DATA;
+		}
+		for (int i = first; i < fFrameCount; i++) {
+			status = _ProcessFrame(fFrames[i], requests, count, &remaining);
+			if (status != B_OK) {
+				_CloseTransport();
+				return status;
+			}
+		}
+	}
 	while (remaining > 0) {
 		if (fFrameCount >= fFrameCapacity) {
 			Log("too many frames in one response\n");
@@ -943,6 +1362,15 @@ Connection::_SendReceive(Request* requests, int count)
 		}
 	}
 
+	if (verifier != NULL) {
+		finisher.verifier = NULL;
+		fDeferVerify = false;
+		if (!verifier->Finish()) {
+			Log("signature verification failed for a pipelined response\n");
+			_CloseTransport();
+			return B_BAD_DATA;
+		}
+	}
 	return B_OK;
 }
 
@@ -1001,7 +1429,13 @@ Connection::_ProcessFrame(Frame& frame, Request* requests, int count,
 			// Verify signature when we have signing keys. The session setup
 			// response that completes authentication is verified after key
 			// derivation by the caller.
-			bool verify = fSigningEnabled && (flags & SMB2_FLAGS_SIGNED) != 0;
+			bool verify = (fSigningEnabled || fHaveSessionKey)
+				&& (flags & SMB2_FLAGS_SIGNED) != 0;
+			if (verify && fDeferVerify
+				&& fVerifier->Submit(const_cast<uint8*>(header),
+					messageLength)) {
+				verify = false;
+			}
 			if (verify && !_VerifyMessage(header, messageLength)) {
 				Log("signature verification failed for command %u\n",
 					command);
@@ -1379,8 +1813,11 @@ Connection::_SessionSetup()
 
 	_DeriveKeys();
 
+	// Every SMB 3.1.1 message is signed unless the user asked for signing
+	// only where the server requires it ("nosign": signing costs much of
+	// the throughput on CPUs without AES instructions).
 	bool wantSigning = fOptions.sign || serverRequiresSigning
-		|| fDialect == SMB2_DIALECT_311;
+		|| (fDialect == SMB2_DIALECT_311 && !fOptions.noSign);
 	if (wantSigning && !fHaveSessionKey) {
 		if (fOptions.sign || serverRequiresSigning) {
 			Log("signing required but no session key available "
@@ -1398,8 +1835,10 @@ Connection::_SessionSetup()
 			Log("session setup response signature invalid\n");
 			return B_PERMISSION_DENIED;
 		}
-	} else if (fSigningEnabled && (flags & SMB2_FLAGS_SIGNED) == 0
+	} else if (fHaveSessionKey && (flags & SMB2_FLAGS_SIGNED) == 0
 		&& fDialect == SMB2_DIALECT_311 && !guest) {
+		// It protects the negotiation (pre-authentication integrity),
+		// with or without signing for the messages that follow.
 		Log("session setup response was not signed\n");
 		return B_PERMISSION_DENIED;
 	}
@@ -1767,6 +2206,49 @@ Connection::Close(const FileId& id, FileInfo* info)
 }
 
 
+// How a read or write of "length" bytes is split into requests: their
+// size and how many go out together. Up to 1 MiB (the default maximum) is
+// sent as requests of 256 KiB, more as up to kMaxPipeline larger ones:
+// pipelined (see _SendReceive()), so that the server starts answering
+// sooner, and one response's signature is checked while the next ones
+// arrive. Credits limit both.
+void
+Connection::_PlanTransfer(size_t length, size_t maxSize, size_t* _size,
+	int* _count) const
+{
+	size_t size = maxSize;
+	if (fSupportsMultiCredit) {
+		size_t creditLimit = (size_t)(fCredits > 0 ? fCredits : 1) * 65536;
+		if (size > creditLimit)
+			size = creditLimit;
+	} else if (size > 65536)
+		size = 65536;
+
+	int count = 1;
+	if (fSupportsMultiCredit && length > kPipelineChunk
+		&& size >= kPipelineChunk) {
+		size_t piece = kPipelineChunk;
+		while (piece < size
+			&& (length + piece - 1) / piece > (size_t)kMaxPipeline) {
+			piece *= 2;
+		}
+		if (piece > size)
+			piece = size;
+		size = piece;
+		count = (int)((length + size - 1) / size);
+		if (count > kMaxPipeline)
+			count = kMaxPipeline;
+		int byCredits = fCredits / _CreditCharge(size);
+		if (count > byCredits)
+			count = byCredits > 1 ? byCredits : 1;
+	}
+	if (size > length)
+		size = length;
+	*_size = size;
+	*_count = count;
+}
+
+
 status_t
 Connection::Read(const FileId& id, uint64 offset, void* _buffer, size_t length,
 	size_t* _bytesRead)
@@ -1779,71 +2261,84 @@ Connection::Read(const FileId& id, uint64 offset, void* _buffer, size_t length,
 		return SMB2_DISCONNECTED;
 
 	while (length > 0) {
-		size_t chunk = length;
-		if (chunk > fMaxReadSize)
-			chunk = fMaxReadSize;
-		if (fSupportsMultiCredit) {
-			size_t creditLimit = (size_t)(fCredits > 0 ? fCredits : 1) * 65536;
-			if (chunk > creditLimit)
-				chunk = creditLimit;
-		} else if (chunk > 65536)
-			chunk = 65536;
+		size_t size;
+		int count;
+		_PlanTransfer(length, fMaxReadSize, &size, &count);
 
-		Request request;
-		request.command = SMB2_READ;
-		request.creditCharge = _CreditCharge(chunk);
-		Packet& body = request.body;
-		body.PutU16(49);
-		body.PutU8(0x50);
-		body.PutU8(0);
-		body.PutU32((uint32)chunk);
-		body.PutU64(offset);
-		body.PutU64(id.persistent);
-		body.PutU64(id.volatileId);
-		body.PutU32(0);					// MinimumCount
-		body.PutU32(0);					// Channel
-		body.PutU32((uint32)(length - chunk));	// RemainingBytes
-		body.PutU16(0);
-		body.PutU16(0);
-		body.PutU8(0);
-		if (body.Failed())
-			return B_NO_MEMORY;
+		Request requests[kMaxPipeline];
+		size_t sizes[kMaxPipeline];
+		size_t planned = 0;
+		for (int i = 0; i < count; i++) {
+			size_t chunk = length - planned;
+			if (chunk > size)
+				chunk = size;
+			if (chunk == 0) {
+				count = i;
+				break;
+			}
+			sizes[i] = chunk;
+			Request& request = requests[i];
+			request.command = SMB2_READ;
+			request.creditCharge = _CreditCharge(chunk);
+			Packet& body = request.body;
+			body.PutU16(49);
+			body.PutU8(0x50);
+			body.PutU8(0);
+			body.PutU32((uint32)chunk);
+			body.PutU64(offset + planned);
+			body.PutU64(id.persistent);
+			body.PutU64(id.volatileId);
+			body.PutU32(0);					// MinimumCount
+			body.PutU32(0);					// Channel
+			body.PutU32((uint32)(length - planned - chunk));	// RemainingBytes
+			body.PutU16(0);
+			body.PutU16(0);
+			body.PutU8(0);
+			if (body.Failed())
+				return *_bytesRead > 0 ? B_OK : B_NO_MEMORY;
+			planned += chunk;
+		}
 
-		status_t status = _SendReceive(&request, 1);
+		status_t status = _SendReceive(requests, count, count == 1);
 		if (status != B_OK)
 			return *_bytesRead > 0 ? B_OK : status;
 
-		if (request.status == STATUS_END_OF_FILE)
-			break;
-		if (request.status != STATUS_SUCCESS
-			&& request.status != STATUS_BUFFER_OVERFLOW) {
-			return *_bytesRead > 0 ? B_OK : NtStatusToError(request.status);
-		}
+		// the data in order, up to the first short read (the end of file)
+		for (int i = 0; i < count; i++) {
+			Request& request = requests[i];
+			if (request.status == STATUS_END_OF_FILE)
+				return B_OK;
+			if (request.status != STATUS_SUCCESS
+				&& request.status != STATUS_BUFFER_OVERFLOW) {
+				return *_bytesRead > 0 ? B_OK
+					: NtStatusToError(request.status);
+			}
 
-		Reader reader(request.response, request.responseLength);
-		uint16 structureSize;
-		uint8 dataOffset, reserved;
-		uint32 dataLength, dataRemaining;
-		if (!reader.U16(structureSize) || structureSize != 17
-			|| !reader.U8(dataOffset) || !reader.U8(reserved)
-			|| !reader.U32(dataLength) || !reader.U32(dataRemaining)) {
-			return B_BAD_DATA;
+			Reader reader(request.response, request.responseLength);
+			uint16 structureSize;
+			uint8 dataOffset, reserved;
+			uint32 dataLength, dataRemaining;
+			if (!reader.U16(structureSize) || structureSize != 17
+				|| !reader.U8(dataOffset) || !reader.U8(reserved)
+				|| !reader.U32(dataLength) || !reader.U32(dataRemaining)) {
+				return B_BAD_DATA;
+			}
+			if (dataLength == 0)
+				return B_OK;
+			if (dataOffset < kHeaderSize
+				|| !reader.ValidRange(dataOffset - kHeaderSize, dataLength)
+				|| dataLength > sizes[i]) {
+				return B_BAD_DATA;
+			}
+			memcpy(buffer, request.response + (dataOffset - kHeaderSize),
+				dataLength);
+			buffer += dataLength;
+			offset += dataLength;
+			length -= dataLength;
+			*_bytesRead += dataLength;
+			if (dataLength < sizes[i])
+				return B_OK;
 		}
-		if (dataLength == 0)
-			break;
-		if (dataOffset < kHeaderSize
-			|| !reader.ValidRange(dataOffset - kHeaderSize, dataLength)
-			|| dataLength > chunk) {
-			return B_BAD_DATA;
-		}
-		memcpy(buffer, request.response + (dataOffset - kHeaderSize),
-			dataLength);
-		buffer += dataLength;
-		offset += dataLength;
-		length -= dataLength;
-		*_bytesRead += dataLength;
-		if (dataLength < chunk)
-			break;
 	}
 	return B_OK;
 }
@@ -1861,56 +2356,70 @@ Connection::Write(const FileId& id, uint64 offset, const void* _buffer,
 		return SMB2_DISCONNECTED;
 
 	while (length > 0) {
-		size_t chunk = length;
-		if (chunk > fMaxWriteSize)
-			chunk = fMaxWriteSize;
-		if (fSupportsMultiCredit) {
-			size_t creditLimit = (size_t)(fCredits > 0 ? fCredits : 1) * 65536;
-			if (chunk > creditLimit)
-				chunk = creditLimit;
-		} else if (chunk > 65536)
-			chunk = 65536;
+		size_t size;
+		int count;
+		_PlanTransfer(length, fMaxWriteSize, &size, &count);
 
-		Request request;
-		request.command = SMB2_WRITE;
-		request.creditCharge = _CreditCharge(chunk);
-		Packet& body = request.body;
-		body.PutU16(49);
-		body.PutU16((uint16)(kHeaderSize + 48));	// DataOffset
-		body.PutU32((uint32)chunk);
-		body.PutU64(offset);
-		body.PutU64(id.persistent);
-		body.PutU64(id.volatileId);
-		body.PutU32(0);					// Channel
-		body.PutU32((uint32)(length - chunk));	// RemainingBytes
-		body.PutU16(0);
-		body.PutU16(0);
-		body.PutU32(0);					// Flags
-		body.PutBytes(buffer, chunk);
-		if (body.Failed())
-			return B_NO_MEMORY;
+		Request requests[kMaxPipeline];
+		size_t sizes[kMaxPipeline];
+		size_t planned = 0;
+		for (int i = 0; i < count; i++) {
+			size_t chunk = length - planned;
+			if (chunk > size)
+				chunk = size;
+			if (chunk == 0) {
+				count = i;
+				break;
+			}
+			sizes[i] = chunk;
+			Request& request = requests[i];
+			request.command = SMB2_WRITE;
+			request.creditCharge = _CreditCharge(chunk);
+			Packet& body = request.body;
+			body.PutU16(49);
+			body.PutU16((uint16)(kHeaderSize + 48));	// DataOffset
+			body.PutU32((uint32)chunk);
+			body.PutU64(offset + planned);
+			body.PutU64(id.persistent);
+			body.PutU64(id.volatileId);
+			body.PutU32(0);					// Channel
+			body.PutU32((uint32)(length - planned - chunk));	// RemainingBytes
+			body.PutU16(0);
+			body.PutU16(0);
+			body.PutU32(0);					// Flags
+			body.PutBytes(buffer + planned, chunk);
+			if (body.Failed())
+				return *_bytesWritten > 0 ? B_OK : B_NO_MEMORY;
+			planned += chunk;
+		}
 
-		status_t status = _SendReceive(&request, 1);
+		status_t status = _SendReceive(requests, count, count == 1);
 		if (status != B_OK)
 			return *_bytesWritten > 0 ? B_OK : status;
-		if (request.status != STATUS_SUCCESS)
-			return *_bytesWritten > 0 ? B_OK : NtStatusToError(request.status);
 
-		Reader reader(request.response, request.responseLength);
-		uint16 structureSize, reserved;
-		uint32 count;
-		if (!reader.U16(structureSize) || structureSize != 17
-			|| !reader.U16(reserved) || !reader.U32(count)) {
-			return B_BAD_DATA;
+		// what was written in order, up to the first short write
+		for (int i = 0; i < count; i++) {
+			Request& request = requests[i];
+			if (request.status != STATUS_SUCCESS) {
+				return *_bytesWritten > 0 ? B_OK
+					: NtStatusToError(request.status);
+			}
+			Reader reader(request.response, request.responseLength);
+			uint16 structureSize, reserved;
+			uint32 written;
+			if (!reader.U16(structureSize) || structureSize != 17
+				|| !reader.U16(reserved) || !reader.U32(written)) {
+				return B_BAD_DATA;
+			}
+			if (written > sizes[i])
+				written = (uint32)sizes[i];
+			buffer += written;
+			offset += written;
+			length -= written;
+			*_bytesWritten += written;
+			if (written < sizes[i])
+				return B_OK;
 		}
-		if (count > chunk)
-			count = (uint32)chunk;
-		buffer += count;
-		offset += count;
-		length -= count;
-		*_bytesWritten += count;
-		if (count == 0)
-			break;
 	}
 	return B_OK;
 }

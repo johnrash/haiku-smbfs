@@ -153,6 +153,7 @@ Volume::_ParseArguments(const char* args)
 	options.maxDialect = SMB2_DIALECT_311;
 	options.cacheTimeout = 2 * 1000000LL;
 	options.requestTimeout = 30 * 1000000LL;
+	options.readAhead = 1024 * 1024;
 	strlcpy(options.workstation, "HAIKU", sizeof(options.workstation));
 
 	if (args == NULL)
@@ -231,6 +232,8 @@ Volume::_ParseArguments(const char* args)
 		} else if (strcmp(key, "sign") == 0) {
 			options.sign = value == NULL || strcmp(value, "true") == 0
 				|| strcmp(value, "1") == 0 || strcmp(value, "yes") == 0;
+		} else if (strcmp(key, "nosign") == 0) {
+			options.noSign = true;
 		} else if (strcmp(key, "seal") == 0 || strcmp(key, "encrypt") == 0) {
 			options.seal = value == NULL || strcmp(value, "true") == 0
 				|| strcmp(value, "1") == 0 || strcmp(value, "yes") == 0;
@@ -251,6 +254,14 @@ Volume::_ParseArguments(const char* args)
 			if (value != NULL) {
 				options.cacheTimeout
 					= (bigtime_t)strtoul(value, NULL, 0) * 1000000LL;
+			}
+		} else if (strcmp(key, "readahead") == 0) {
+			// KiB; 0 turns it off
+			if (value != NULL) {
+				unsigned long kib = strtoul(value, NULL, 0);
+				if (kib > 16 * 1024)
+					kib = 16 * 1024;
+				options.readAhead = (uint32)kib * 1024;
 			}
 		} else if (strcmp(key, "timeout") == 0) {
 			if (value != NULL) {
@@ -305,6 +316,7 @@ Volume::Mount(const char* args, uint32 flags)
 
 	smb2::Options connectionOptions;
 	connectionOptions.sign = fOptions.sign;
+	connectionOptions.noSign = fOptions.noSign && !fOptions.sign;
 	connectionOptions.seal = fOptions.seal;
 	connectionOptions.minDialect = fOptions.minDialect;
 	connectionOptions.maxDialect = fOptions.maxDialect;

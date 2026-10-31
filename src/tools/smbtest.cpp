@@ -586,6 +586,7 @@ usage()
 		"  -P <port>        TCP port (default 445)\n"
 		"  --sign           require signing\n"
 		"  --seal           require encryption\n"
+		"  --no-sign        sign only if the server requires it\n"
 		"  --max-dialect X  highest dialect to offer (e.g. 0x0302)\n"
 		"  --min-dialect X  lowest dialect to offer\n"
 		"  --local-root D   local directory that mirrors the share (selftest)\n"
@@ -639,6 +640,8 @@ main(int argc, char** argv)
 			options.sign = true;
 		else if (strcmp(arg, "--seal") == 0)
 			options.seal = true;
+		else if (strcmp(arg, "--no-sign") == 0)
+			options.noSign = true;
 		else if (strcmp(arg, "--max-dialect") == 0 && i + 1 < argc)
 			options.maxDialect = (uint16)strtoul(argv[++i], NULL, 0);
 		else if (strcmp(arg, "--min-dialect") == 0 && i + 1 < argc)

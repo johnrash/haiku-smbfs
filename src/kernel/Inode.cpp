@@ -16,6 +16,7 @@
 #include <KernelExport.h>
 #include <NodeMonitor.h>
 
+#include "FileCacheCompat.h"
 #include "Volume.h"
 #include "../smb2/Utf.h"
 
@@ -24,6 +25,8 @@ using namespace smb2;
 
 static const size_t kDirectoryBufferSize = 65536;
 static const size_t kBounceBufferSize = 1024 * 1024;
+static const size_t kFirstReadAheadWindow = 256 * 1024;
+static const uint64 kNoReadOffset = ~(uint64)0;
 
 
 // Heap allocated path buffer: these functions may run in deep call chains
@@ -59,7 +62,17 @@ Inode::Inode(Volume* volume, ino_t id, Inode* parent, const char* name,
 	fCacheResize(false),
 	fLastLocalWrite(0),
 	fWriterCookies(NULL),
-	fWriteBackError(B_OK)
+	fReaderCookies(NULL),
+	fWriteBackError(B_OK),
+	fDataGeneration(0),
+	fReadAheadLock("smbfs read-ahead"),
+	fReadAheadBuffer(NULL),
+	fReadAheadOffset(0),
+	fReadAheadLength(0),
+	fReadAheadGeneration(0),
+	fReadAheadTime(0),
+	fReadAheadWindow(0),
+	fNextReadOffset(kNoReadOffset)
 {
 }
 
@@ -74,6 +87,7 @@ static const bigtime_t kLocalWriteSettleTime = 10 * 1000000LL;
 Inode::~Inode()
 {
 	DeleteFileCache();
+	free(fReadAheadBuffer);
 	free(fName);
 }
 
@@ -113,6 +127,7 @@ Inode::_SetSize(uint64 size)
 		MutexLocker locker(fLock);
 		fInfo.endOfFile = size;
 		fCacheResize = false;
+		fDataGeneration++;
 	}
 	if (fFileCache != NULL)
 		file_cache_set_size(fFileCache, (off_t)size);
@@ -150,6 +165,8 @@ Inode::_ApplyServerInfo(const FileInfo& info, bool keepIdentity,
 	}
 	fInfoTime = now;
 	fInfoValid = true;
+	if (changed)
+		fDataGeneration++;
 	if (action == kCacheCheck && changed && !recentlyWritten)
 		fCacheInvalidate = true;
 	if (action != kCacheIgnore)
@@ -385,12 +402,12 @@ Inode::WriteStat(const struct stat* stat, uint32 mask)
 			// Prefer an open writable handle: times set through the handle
 			// that wrote the data are kept when that handle is closed.
 			FileCookie handle;
-			FileCookie* owner = _BorrowWriteHandle(handle);
+			FileCookie* owner = _BorrowHandle(handle, true);
 			status = B_ERROR;
 			if (owner != NULL) {
 				status = connection->SetBasicInfo(handle.id, creationTime,
 					accessTime, writeTime, 0, attributes);
-				_ReturnWriteHandle(owner);
+				_ReturnHandle(owner);
 			}
 			if (status != B_OK) {
 				status = connection->SetPathBasicInfo(path, creationTime,
@@ -458,31 +475,37 @@ void
 Inode::_AttachCookie(FileCookie* cookie)
 {
 	cookie->attached = true;
+	MutexLocker locker(fLock);
 	if ((cookie->desiredAccess & FILE_WRITE_DATA) != 0) {
-		MutexLocker locker(fLock);
 		fWriters++;
 		cookie->nextWriter = fWriterCookies;
 		fWriterCookies = cookie;
 	}
+	if ((cookie->desiredAccess & FILE_READ_DATA) != 0) {
+		cookie->nextReader = fReaderCookies;
+		fReaderCookies = cookie;
+	}
 }
 
 
-// Finds an open, writable handle of this file and copies it into "handle".
-// The returned owner cookie must be given back with _ReturnWriteHandle();
-// until then Close() does not close the handle. Returns NULL if there is no
-// usable writer.
+// Finds an open handle of this file, writable or readable, and copies it
+// into "handle". The returned owner cookie must be given back with
+// _ReturnHandle(); until then Close() does not close the handle. Returns
+// NULL if there is no usable one.
 //
 // Write-back must not open the file again when a writer exists: copy tools
 // make a file read-only before closing it, and the server then refuses new
 // opens for writing, while an existing handle keeps its access. Data still
-// in the file cache would be lost.
+// in the file cache would be lost. Cache reads use an open handle too: an
+// open and a close around each chunk cost two more round trips.
 FileCookie*
-Inode::_BorrowWriteHandle(FileCookie& handle)
+Inode::_BorrowHandle(FileCookie& handle, bool write)
 {
 	uint32 generation = fVolume->GetConnection()->Generation();
 	MutexLocker locker(fLock);
-	for (FileCookie* cookie = fWriterCookies; cookie != NULL;
-			cookie = cookie->nextWriter) {
+	for (FileCookie* cookie = write ? fWriterCookies : fReaderCookies;
+			cookie != NULL;
+			cookie = write ? cookie->nextWriter : cookie->nextReader) {
 		if (cookie->id.IsValid() && cookie->generation == generation) {
 			cookie->borrowers++;
 			handle.id = cookie->id;
@@ -498,17 +521,17 @@ Inode::_BorrowWriteHandle(FileCookie& handle)
 
 
 void
-Inode::_ReturnWriteHandle(FileCookie* owner)
+Inode::_ReturnHandle(FileCookie* owner)
 {
 	MutexLocker locker(fLock);
 	owner->borrowers--;
 }
 
 
-// Unregisters an open writer, then waits until no write-back uses its
-// handle any more, so that it can be closed.
+// Unregisters an open handle, then waits until no cache I/O uses it any
+// more, so that it can be closed.
 void
-Inode::_RemoveWriter(FileCookie* cookie)
+Inode::_DetachCookie(FileCookie* cookie)
 {
 	MutexLocker locker(fLock);
 	for (FileCookie** link = &fWriterCookies; *link != NULL;
@@ -519,8 +542,16 @@ Inode::_RemoveWriter(FileCookie* cookie)
 		}
 	}
 	cookie->nextWriter = NULL;
+	for (FileCookie** link = &fReaderCookies; *link != NULL;
+			link = &(*link)->nextReader) {
+		if (*link == cookie) {
+			*link = cookie->nextReader;
+			break;
+		}
+	}
+	cookie->nextReader = NULL;
 	while (cookie->borrowers > 0) {
-		// a write-back of the page writer is in progress
+		// a write-back of the page writer, or a cache read, is in progress
 		locker.Unlock();
 		Snooze(1000);
 		locker.Lock();
@@ -631,11 +662,17 @@ Inode::Close(FileCookie* cookie)
 	status_t result = B_OK;
 	if (writer && fFileCache != NULL) {
 		// Push pending data to the server while this handle is still open
-		// (write-back borrows it, see _BorrowWriteHandle()).
+		// (write-back borrows it, see _BorrowHandle()).
 		result = file_cache_sync(fFileCache);
 	}
-	if (writer)
-		_RemoveWriter(cookie);
+	bool last = false;
+	if (cookie->attached) {
+		_DetachCookie(cookie);
+		MutexLocker locker(fLock);
+		last = fReaderCookies == NULL && fWriterCookies == NULL;
+	}
+	if (last)
+		_FreeReadAhead();
 
 	Connection* connection = fVolume->GetConnection();
 	FileInfo info;
@@ -721,6 +758,7 @@ Inode::_WriteDirect(FileCookie* cookie, off_t pos, const void* buffer,
 			fInfo.lastWriteTime = ((uint64)RealTimeUsecs()
 				+ 11644473600000000ULL) * 10;
 			fLastLocalWrite = SystemTime();
+			fDataGeneration++;
 			return B_OK;
 		}
 		if (status != SMB2_DISCONNECTED)
@@ -728,6 +766,107 @@ Inode::_WriteDirect(FileCookie* cookie, off_t pos, const void* buffer,
 	}
 	*_length = 0;
 	return status;
+}
+
+
+// Reads for the file cache (read_pages). The file cache asks for what it
+// misses, at most 128 KiB at a time, and reads nothing ahead itself: a
+// sequential reader cost a round trip a chunk, or a page when it read in
+// small pieces. Once reads follow each other, a window is fetched instead,
+// growing from 256 KiB to the readahead option (1 MiB by default), and the
+// next chunks are copied from it. The first read of a file is never
+// widened (Tracker's type sniffing reads the start of many files). Writes,
+// size changes and changes on the server make the window stale
+// (fDataGeneration), and so does age, as for the attribute cache.
+status_t
+Inode::_ReadAhead(FileCookie* cookie, off_t pos, uint8* buffer, size_t length,
+	size_t* _read)
+{
+	const MountOptions& options = fVolume->Options();
+	MutexLocker readAheadLocker(fReadAheadLock);
+	uint32 generation;
+	uint64 fileSize;
+	{
+		MutexLocker locker(fLock);
+		generation = fDataGeneration;
+		fileSize = fInfo.endOfFile;
+	}
+	uint64 offset = (uint64)pos;
+	*_read = 0;
+
+	if (fReadAheadLength > 0 && fReadAheadGeneration == generation
+		&& SystemTime() - fReadAheadTime < options.cacheTimeout
+		&& offset >= fReadAheadOffset
+		&& offset < fReadAheadOffset + fReadAheadLength) {
+		size_t count = fReadAheadOffset + fReadAheadLength - offset;
+		if (count > length)
+			count = length;
+		memcpy(buffer, fReadAheadBuffer + (offset - fReadAheadOffset), count);
+		fNextReadOffset = offset + count;
+		*_read = count;
+		return B_OK;
+	}
+	fReadAheadLength = 0;
+
+	size_t window = options.readAhead;
+	bool sequential = offset == fNextReadOffset;
+	if (!sequential || window == 0 || length >= window) {
+		fReadAheadWindow = 0;
+		size_t count = length;
+		status_t status = _ReadDirect(cookie, pos, buffer, &count);
+		if (status != B_OK)
+			return status;
+		fNextReadOffset = offset + count;
+		*_read = count;
+		return B_OK;
+	}
+
+	if (fReadAheadBuffer == NULL) {
+		fReadAheadBuffer = (uint8*)malloc(window);
+		if (fReadAheadBuffer == NULL) {
+			size_t count = length;
+			status_t status = _ReadDirect(cookie, pos, buffer, &count);
+			if (status == B_OK) {
+				fNextReadOffset = offset + count;
+				*_read = count;
+			}
+			return status;
+		}
+	}
+	size_t fetch = fReadAheadWindow == 0 ? kFirstReadAheadWindow
+		: fReadAheadWindow * 2;
+	if (fetch > window)
+		fetch = window;
+	fReadAheadWindow = fetch;
+	if (offset < fileSize && fetch > fileSize - offset)
+		fetch = (size_t)(fileSize - offset);
+	if (fetch < length)
+		fetch = length;
+
+	status_t status = _ReadDirect(cookie, pos, fReadAheadBuffer, &fetch);
+	if (status != B_OK)
+		return status;
+	fReadAheadOffset = offset;
+	fReadAheadLength = fetch;
+	fReadAheadGeneration = generation;
+	fReadAheadTime = SystemTime();
+	size_t count = fetch < length ? fetch : length;
+	memcpy(buffer, fReadAheadBuffer, count);
+	fNextReadOffset = offset + count;
+	*_read = count;
+	return B_OK;
+}
+
+
+void
+Inode::_FreeReadAhead()
+{
+	MutexLocker locker(fReadAheadLock);
+	free(fReadAheadBuffer);
+	fReadAheadBuffer = NULL;
+	fReadAheadLength = 0;
+	fReadAheadWindow = 0;
+	fNextReadOffset = kNoReadOffset;
 }
 
 
@@ -743,7 +882,7 @@ Inode::Read(FileCookie* cookie, off_t pos, void* buffer, size_t* _length)
 
 	if (fFileCache != NULL) {
 		_SyncCache();
-		return file_cache_read(fFileCache, cookie, pos, buffer, _length);
+		return compat_file_cache_read(fFileCache, cookie, pos, buffer, _length);
 	}
 
 	if (!IS_USER_ADDRESS(buffer))
@@ -815,7 +954,7 @@ Inode::Write(FileCookie* cookie, off_t pos, const void* buffer,
 		}
 		if (extend)
 			_SetSize(end);
-		return file_cache_write(fFileCache, cookie, pos, buffer, _length);
+		return compat_file_cache_write(fFileCache, cookie, pos, buffer, _length);
 	}
 
 	if (!IS_USER_ADDRESS(buffer))
@@ -857,36 +996,58 @@ status_t
 Inode::ReadPages(FileCookie* cookie, off_t pos, const iovec* vecs,
 	size_t count, size_t* _numBytes)
 {
+	// The file cache calls us without a cookie: use an open readable handle
+	// then, and only open the file again if there is none.
 	FileCookie temporary;
+	FileCookie* owner = NULL;
+	smb2::FileId borrowedId;
 	bool useTemporary = cookie == NULL || !cookie->id.IsValid()
 		|| (cookie->desiredAccess & FILE_READ_DATA) == 0;
 	if (useTemporary) {
-		temporary.desiredAccess = FILE_READ_DATA | FILE_READ_ATTRIBUTES;
-		temporary.createOptions = FILE_NON_DIRECTORY_FILE;
+		owner = _BorrowHandle(temporary, false);
+		if (owner == NULL) {
+			temporary.desiredAccess = FILE_READ_DATA | FILE_READ_ATTRIBUTES;
+			temporary.createOptions = FILE_NON_DIRECTORY_FILE;
+		}
+		borrowedId = temporary.id;
 		cookie = &temporary;
 	}
 
 	size_t total = 0;
 	status_t status = B_OK;
 	for (size_t i = 0; i < count; i++) {
-		size_t length = vecs[i].iov_len;
-		status = _ReadDirect(cookie, pos, vecs[i].iov_base, &length);
+		uint8* base = (uint8*)vecs[i].iov_base;
+		size_t done = 0;
+		while (done < vecs[i].iov_len) {
+			size_t length = 0;
+			status = _ReadAhead(cookie, pos, base + done,
+				vecs[i].iov_len - done, &length);
+			if (status != B_OK || length == 0)
+				break;
+			done += length;
+			pos += length;
+		}
+		total += done;
 		if (status != B_OK)
 			break;
-		total += length;
-		pos += length;
-		if (length < vecs[i].iov_len) {
+		if (done < vecs[i].iov_len) {
 			// Short read: zero fill the rest of the request (EOF).
-			memset((uint8*)vecs[i].iov_base + length, 0,
-				vecs[i].iov_len - length);
+			memset(base + done, 0, vecs[i].iov_len - done);
 			for (size_t j = i + 1; j < count; j++)
 				memset(vecs[j].iov_base, 0, vecs[j].iov_len);
 			break;
 		}
 	}
 
-	if (useTemporary && temporary.id.IsValid())
+	if (owner != NULL)
+		_ReturnHandle(owner);
+	// Close what we opened ourselves: a temporary handle, or the reopened
+	// copy of a borrowed one after a reconnect (never the borrowed handle).
+	if (useTemporary && temporary.id.IsValid()
+		&& (owner == NULL || temporary.id.persistent != borrowedId.persistent
+			|| temporary.id.volatileId != borrowedId.volatileId)) {
 		Close(&temporary);
+	}
 
 	if (total > 0)
 		status = B_OK;
@@ -904,14 +1065,14 @@ Inode::WritePages(FileCookie* cookie, off_t pos, const iovec* vecs,
 
 	// The page writer and file_cache_sync() call us without a cookie. Use an
 	// open writable handle then, and only open the file again if there is
-	// none (see _BorrowWriteHandle()).
+	// none (see _BorrowHandle()).
 	FileCookie temporary;
 	FileCookie* owner = NULL;
 	smb2::FileId borrowedId;
 	bool useTemporary = cookie == NULL || !cookie->id.IsValid()
 		|| (cookie->desiredAccess & FILE_WRITE_DATA) == 0;
 	if (useTemporary) {
-		owner = _BorrowWriteHandle(temporary);
+		owner = _BorrowHandle(temporary, true);
 		if (owner == NULL) {
 			temporary.desiredAccess = FILE_WRITE_DATA | FILE_READ_ATTRIBUTES
 				| FILE_WRITE_ATTRIBUTES;
@@ -949,7 +1110,7 @@ Inode::WritePages(FileCookie* cookie, off_t pos, const iovec* vecs,
 	}
 
 	if (owner != NULL)
-		_ReturnWriteHandle(owner);
+		_ReturnHandle(owner);
 	// Close what we opened ourselves: a temporary handle, or the reopened
 	// copy of a borrowed one after a reconnect (never the borrowed handle).
 	if (useTemporary && temporary.id.IsValid()

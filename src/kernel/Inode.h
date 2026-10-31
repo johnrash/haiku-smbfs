@@ -25,7 +25,8 @@ struct FileCookie {
 	bool				directory;
 	bool				attached;	// registered with the inode (not temporary)
 	FileCookie*			nextWriter;	// the inode's open writers (inode lock)
-	int32				borrowers;	// write-backs using this handle (inode lock)
+	FileCookie*			nextReader;	// the inode's open readers (inode lock)
+	int32				borrowers;	// cache I/O using this handle (inode lock)
 
 	FileCookie()
 		:
@@ -36,6 +37,7 @@ struct FileCookie {
 		directory(false),
 		attached(false),
 		nextWriter(NULL),
+		nextReader(NULL),
 		borrowers(0)
 	{
 	}
@@ -160,9 +162,14 @@ private:
 			void				_SyncCache();
 			void				_SetSize(uint64 size);
 			void				_AttachCookie(FileCookie* cookie);
-			FileCookie*			_BorrowWriteHandle(FileCookie& handle);
-			void				_ReturnWriteHandle(FileCookie* owner);
-			void				_RemoveWriter(FileCookie* cookie);
+			FileCookie*			_BorrowHandle(FileCookie& handle,
+									bool write);
+			void				_ReturnHandle(FileCookie* owner);
+			void				_DetachCookie(FileCookie* cookie);
+			status_t			_ReadAhead(FileCookie* cookie, off_t pos,
+									uint8* buffer, size_t length,
+									size_t* _read);
+			void				_FreeReadAhead();
 			status_t			_TakeWriteBackError();
 			status_t			_EnsureDirOpen(DirCookie* cookie);
 			status_t			_FillDirectory(DirCookie* cookie);
@@ -194,7 +201,21 @@ private:
 			bool				fCacheResize;
 			bigtime_t			fLastLocalWrite;	// our last data write
 			FileCookie*			fWriterCookies;		// open writable handles
+			FileCookie*			fReaderCookies;		// open readable handles
 			status_t			fWriteBackError;	// not yet reported
+			uint32				fDataGeneration;
+				// changes with the file's data (writes, size changes,
+				// changes on the server); inode lock
+
+			// read-ahead for the file cache, see _ReadAhead()
+			smb2::Mutex			fReadAheadLock;
+			uint8*				fReadAheadBuffer;
+			uint64				fReadAheadOffset;
+			size_t				fReadAheadLength;
+			uint32				fReadAheadGeneration;
+			bigtime_t			fReadAheadTime;
+			size_t				fReadAheadWindow;
+			uint64				fNextReadOffset;
 };
 
 

@@ -33,6 +33,9 @@ usage(FILE* out)
 		"  -d, --domain <domain>    domain or workgroup\n"
 		"  -r, --read-only          mount read-only\n"
 		"  -s, --sign               require message signing\n"
+		"  -N, --no-sign            sign only if the server requires it (SMB\n"
+		"                           3.1.1 otherwise signs everything): faster,\n"
+		"                           for trusted networks\n"
 		"  -e, --encrypt            require encryption (SMB 3.x)\n"
 		"  -P, --port <port>        TCP port (default 445)\n"
 		"  -o, --options <list>     additional smbfs mount options, separated\n"
@@ -178,6 +181,7 @@ main(int argc, char** argv)
 	const char* extraOptions = NULL;
 	bool readOnly = false;
 	bool sign = false;
+	bool noSign = false;
 	bool seal = false;
 	bool noPrompt = false;
 
@@ -187,6 +191,7 @@ main(int argc, char** argv)
 		{"domain", required_argument, NULL, 'd'},
 		{"read-only", no_argument, NULL, 'r'},
 		{"sign", no_argument, NULL, 's'},
+		{"no-sign", no_argument, NULL, 'N'},
 		{"encrypt", no_argument, NULL, 'e'},
 		{"port", required_argument, NULL, 'P'},
 		{"options", required_argument, NULL, 'o'},
@@ -196,7 +201,7 @@ main(int argc, char** argv)
 	};
 
 	int c;
-	while ((c = getopt_long(argc, argv, "u:p:d:rseP:o:nh", kLongOptions,
+	while ((c = getopt_long(argc, argv, "u:p:d:rsNeP:o:nh", kLongOptions,
 			NULL)) != -1) {
 		switch (c) {
 			case 'u': user = optarg; break;
@@ -204,6 +209,7 @@ main(int argc, char** argv)
 			case 'd': domain = optarg; break;
 			case 'r': readOnly = true; break;
 			case 's': sign = true; break;
+			case 'N': noSign = true; break;
 			case 'e': seal = true; break;
 			case 'P': port = optarg; break;
 			case 'o': extraOptions = optarg; break;
@@ -274,6 +280,8 @@ main(int argc, char** argv)
 	append_option(parameters, "port", port);
 	if (sign)
 		parameters << " sign";
+	else if (noSign)
+		parameters << " nosign";
 	if (seal)
 		parameters << " seal";
 	if (extraOptions != NULL && extraOptions[0] != '\0')

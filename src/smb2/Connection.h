@@ -86,6 +86,8 @@ struct Options {
 	uint16				minDialect;
 	uint16				maxDialect;
 	bool				sign;			// require message signing
+	bool				noSign;			// sign only what the server requires
+										// (not every SMB 3.1.1 message)
 	bool				seal;			// require encryption
 	bigtime_t			timeout;		// per request, microseconds
 	uint32				maxReadSize;	// upper bound for a single READ
@@ -96,6 +98,7 @@ struct Options {
 		minDialect(SMB2_DIALECT_202),
 		maxDialect(SMB2_DIALECT_311),
 		sign(false),
+		noSign(false),
 		seal(false),
 		timeout(30 * 1000000LL),
 		maxReadSize(1024 * 1024),
@@ -242,6 +245,7 @@ public:
 private:
 	struct Request;
 	struct Frame;
+	class Verifier;
 
 			status_t			_EnsureConnected();
 			status_t			_ConnectTransport();
@@ -253,7 +257,12 @@ private:
 			void				_PreauthUpdate(const uint8* data,
 									size_t length);
 
-			status_t			_SendReceive(Request* requests, int count);
+			status_t			_SendReceive(Request* requests, int count,
+									bool compound = true);
+			status_t			_BuildFrame(Request* requests, int count,
+									Packet& frame, bool finish);
+			status_t			_SendFrame(Request* requests, int count);
+			Verifier*			_GetVerifier();
 			status_t			_SendAll(const uint8* data, size_t length);
 			status_t			_ReceiveExactly(uint8* buffer, size_t length);
 			status_t			_ReceiveFrame(Frame& frame);
@@ -263,10 +272,14 @@ private:
 									int* _remaining);
 			status_t			_DecryptFrame(Frame& frame);
 			status_t			_EncryptSendBuffer();
+			status_t			_EncryptFrame(Packet& frame,
+									uint64 nonceValue) const;
 			void				_SignMessage(uint8* message, size_t length);
 			bool				_VerifyMessage(const uint8* message,
 									size_t length);
 			uint16				_CreditCharge(size_t payload) const;
+			void				_PlanTransfer(size_t length, size_t maxSize,
+									size_t* _size, int* _count) const;
 			void				_FillHeader(uint8* header,
 									const Request& request, uint32 flags,
 									uint32 nextCommand);
@@ -342,7 +355,6 @@ private:
 			uint8				fSigningKey[16];
 			uint8				fEncryptionKey[16];
 			uint8				fDecryptionKey[16];
-			crypto::AESCMAC		fSigningCmac;
 			bool				fEncryptionEnabled;
 			uint64				fNonceCounter;
 			uint8				fNonceRandom[8];
@@ -357,6 +369,9 @@ private:
 			Frame*				fFrames;
 			int					fFrameCount;
 			int					fFrameCapacity;
+			Verifier*			fVerifier;
+			bool				fVerifierTried;
+			bool				fDeferVerify;
 };
 
 
